@@ -43,6 +43,7 @@
          error_info/1,
          timem_basic/1,
          is_bif_traced/1,
+         gc_multi_session/1,
 
          end_of_list/1]).
 
@@ -56,7 +57,7 @@
 -define(line,void).
 -endif.
 
--export([foo/0, exported/1, middle/1, bottom/1]).
+-export([foo/0, exported/1, middle/1, bottom/1, gc_multi_session_do/1]).
 
 suite() ->
     [{ct_hooks,[ts_install_cth]},
@@ -83,6 +84,7 @@ all() ->
      error_info,
      timem_basic,
      is_bif_traced,
+     gc_multi_session,
 
      end_of_list].
 
@@ -1981,6 +1983,44 @@ is_bif_traced_do(CT1, CT2, CT3) ->
     receive_nothing(),
 
     trace:session_destroy(S3),
+    ok.
+
+
+%% Verify that 'garbage_collection' tracing works for multiple sessions.
+%% trace_gc() reused its 'msg' argument as state between the sessions.
+gc_multi_session(_Config) ->
+    %% A regression kills the emulator, so trace on a peer node.
+    {ok, Peer, Node} = ?CT_PEER(),
+    try
+        ok = erpc:call(Node, ?MODULE, gc_multi_session_do, [1]),
+        ok = erpc:call(Node, ?MODULE, gc_multi_session_do, [2])
+    catch
+        error:{erpc, noconnection} ->
+            ct:fail("emulator died tracing garbage_collection from "
+                    "two sessions")
+    after
+        try peer:stop(Peer) catch _:_ -> ok end
+    end.
+
+%% Trace one process from N sessions over a single collection.
+gc_multi_session_do(N) ->
+    Tester = self(),
+    Tracers = [spawn_link(fun() -> tracer("Tracer" ++ integer_to_list(I), Tester) end)
+               || I <- lists:seq(1, N)],
+    Sessions = [trace:session_create(list_to_atom("gc_session" ++ integer_to_list(I)),
+                                     Tracer, [])
+                || {I, Tracer} <- lists:zip(lists:seq(1, N), Tracers)],
+
+    Tracee = spawn(fun() -> receive go -> erlang:garbage_collect() end end),
+    [1 = trace:process(S, Tracee, true, [garbage_collection]) || S <- Sessions],
+    Tracee ! go,
+
+    receive_parallel_list(
+      [[{Tracer, {trace, Tracee, gc_major_start, '_'}},
+        {Tracer, {trace, Tracee, gc_major_end, '_'}}] || Tracer <- Tracers]),
+
+    [true = trace:session_destroy(S) || S <- Sessions],
+    [begin unlink(Tracer), exit(Tracer, die) end || Tracer <- Tracers],
     ok.
 
 
